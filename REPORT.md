@@ -226,6 +226,30 @@ Per-criterion (Pearson r / MAE):
 
 **Honest framing.** With n = 3, this is a *sanity check* — not a calibration study. It shows the LLM judge is in the right neighborhood of the human (small MAEs) and agrees with the human on coarse rank-ordering (high holistic r), but is not enough data to bind the LLM judge's reliability with confidence intervals. Scaling this to n ≥ 20 with multiple raters would let us compute inter-rater reliability (Krippendorff's α) and tighter human ↔ LLM agreement bounds; we list this as future work (§4).
 
+## 6. Design Decisions That Matter
+
+Nine deliberate choices that distinguish this work from a checkbox-style multi-agent implementation. Each addresses a specific failure mode in the LLM-evaluation-and-safety stack.
+
+**6.1 Dual-orchestrator behind one flag.** AutoGen and LangGraph share a single `process_query` interface dispatched through `src/orchestrator_factory.py`. Flipping `system.orchestrator` in `config.yaml` swaps the backend with zero code changes elsewhere. Lets us *measure* topology trade-offs empirically — we found AutoGen's round-robin chat re-sees the full conversation each turn and blows through Groq's per-minute quota by the Critic's turn, while LangGraph's state graph stays within budget. We picked LangGraph as default on measured token economics, not aesthetics.
+
+**6.2 Three-layer safety, cheapest layer always works alone.** Deterministic rules (regex + keyword banks) run every request, sub-50 ms, zero LLM cost — catch 14/14 adversarial cases on their own. NeMo Guardrails (`safety.use_nemo`) and NLI hallucination detection (`safety.use_nli_check`) are opt-in second/third layers that fail gracefully if unavailable. A fresh checkout with no NeMo install is still 14/14 on the benchmark; the expensive layers add depth, not correctness.
+
+**6.3 Cross-model judging to avoid self-evaluation bias.** Agents on Meta Llama 3.x; judge on OpenAI `gpt-oss-120b` — architecturally distinct families. Zheng et al. (2023) document a "narcissism bias" where LLM judges prefer outputs from their own family. Splitting families eliminates the worst case (judge favoring its own response). One config line; substantial methodological payoff.
+
+**6.4 Two-perspective judging within that cross-model framework.** Rubric judge (5 calls anchored to a 5-level rubric, returns strict JSON) + holistic peer-reviewer judge (1 call, 1–10 composite). Final = `(rubric_avg + holistic_normalized) / 2`. Rubric is high-resolution but over-confident; holistic is integrative but coarse. Averaging smooths individual perspective bias; disagreement is itself a diagnostic.
+
+**6.5 Silent-failure sentinel pattern.** The judge's `_call_llm` originally returned `{"score": 0.0, "reasoning": "Connection error"}` on transport failure — and the aggregator averaged that 0 into the overall. A single DNS blip dragged a representative-run score from 0.66 to 0.42. Fix: return `{"score": None, "_failed": True}` and have the aggregator *skip* `None`. **"Failed to evaluate" and "evaluated as zero" must be different values in your data model.** Generalizable pattern most LLM-judge implementations conflate.
+
+**6.6 Explicit timeout budgets at every hop.** N third-party services per query = N independent ways to hang. `concurrent.futures` timeouts on tool calls (30 s), per-request timeouts on every LLM call (60 s agents, 45 s judge, 30 s NLI), `max_iterations` cap on the revision loop. Worst-case query duration bounded at ~5 min. Discovered by hitting a 4-minute UI hang at 0 % CPU with two open Cloudflare connections — the fix was just *acknowledging every external call needs a timeout budget*.
+
+**6.7 Live agent streaming as a transparency lever.** `LangGraphOrchestrator.process_query_stream` yields lifecycle events (`input_check`, four `node_end`s, `output_check`, `done`) consumed by an `st.status` panel that ticks off each agent in real time. Surfaces *which agent is active* — and structural facts like the Critic-triggered revision loop — that an opaque spinner hides. Same `process_query` API stays available for CLI/batch evaluator.
+
+**6.8 Human eval triangulation co-located with the LLM judge.** The rating widget sits *directly below* the LLM-judge scores on the same screen, with the same criteria, same 0–1 scale, same response in view. Forces apples-to-apples comparison and slashes the cost of running the study — we collected 3 ratings in under 10 minutes; with conventional separate-UI infrastructure this is an afternoon of work.
+
+**6.9 Adversarial test set with a deliberately failing case.** `data/safety_test_queries.json` ships 14 cases, 13 fully blocked + 1 (`safety_13`, leetspeak `m4k3 a b0mb`) marked `should_be_caught: "partial"`. Documenting a known-failing-on-purpose case is methodological honesty: a 14/14 perfect-on-self-written-tests result is suspicious. The leetspeak gap also points at concrete future work (the `safety.use_llm_classifier` flag exists in config, just unwired).
+
+Together these are the actual contribution — not the agents (standard AutoGen + LangGraph scaffolds) but **meta-level decisions about how multi-agent LLM systems should be safely built, transparently evaluated, and honestly reported.**
+
 ## References
 
 Chase, H., & the LangChain team. (2024). *LangGraph documentation.* https://langchain-ai.github.io/langgraph/
