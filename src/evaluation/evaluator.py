@@ -28,16 +28,7 @@ from .judge import LLMJudge
 
 
 class SystemEvaluator:
-    """
-    Evaluates the multi-agent system using test queries and LLM-as-a-Judge.
-
-    TODO: YOUR CODE HERE
-    - Load test queries from file
-    - Run system on all test queries
-    - Collect and aggregate results
-    - Generate evaluation report
-    - Perform error analysis
-    """
+    """Evaluates the multi-agent system using test queries and LLM-as-a-Judge."""
 
     def __init__(self, config: Dict[str, Any], orchestrator=None):
         """
@@ -76,13 +67,6 @@ class SystemEvaluator:
 
         Returns:
             Evaluation results and statistics
-
-        TODO: YOUR CODE HERE
-        - Load test queries
-        - Run system on each query
-        - Evaluate each response
-        - Aggregate results
-        - Generate report
         """
         # Check if evaluation is enabled in config.yaml
         if not self.enabled:
@@ -120,71 +104,59 @@ class SystemEvaluator:
         """
         Evaluate a single test query.
 
-        Args:
-            test_case: Test case with query and optional ground truth
-
-        Returns:
-            Evaluation result for this query
-
-        This shows how to integrate with the orchestrator.
+        Calls the orchestrator (sync or async — auto-detected) and passes the
+        result to the LLM judge.
         """
         query = test_case.get("query", "")
         ground_truth = test_case.get("ground_truth")
-        expected_sources = test_case.get("expected_sources", [])
+        query_id = test_case.get("id") or test_case.get("category") or query[:20]
 
-        # Run through orchestrator if available
+        # Run through orchestrator if available; support sync OR async signatures.
         if self.orchestrator:
             try:
-                # Call orchestrator's process_query method
-                # TODO: YOUR CODE HERE
-                # Need to implement this in their orchestrator
-                response_data = self.orchestrator.process_query(query)
-                
-                # If process_query is async, use:
-                # response_data = await self.orchestrator.process_query(query)
-                
+                proc = self.orchestrator.process_query(query)
+                if inspect.isawaitable(proc):
+                    response_data = await proc
+                else:
+                    response_data = proc
             except Exception as e:
                 self.logger.error(f"Error processing query through orchestrator: {e}")
                 response_data = {
                     "query": query,
                     "response": f"Error: {str(e)}",
                     "citations": [],
-                    "metadata": {"error": str(e)}
+                    "metadata": {"error": str(e)},
                 }
         else:
-            # Placeholder for testing without orchestrator
             self.logger.warning("No orchestrator provided, using placeholder response")
             response_data = {
                 "query": query,
                 "response": "Placeholder response - orchestrator not connected",
                 "citations": [],
-                "metadata": {"num_sources": 0}
+                "metadata": {"num_sources": 0},
             }
 
-        # Evaluate response using LLM-as-a-Judge
+        # Evaluate response using LLM-as-a-Judge (two perspectives)
         evaluation = await self.judge.evaluate(
             query=query,
             response=response_data.get("response", ""),
             sources=response_data.get("metadata", {}).get("sources", []),
-            ground_truth=ground_truth
+            ground_truth=ground_truth,
+            query_id=str(query_id),
         )
 
         return {
             "query": query,
+            "query_id": query_id,
+            "category": test_case.get("category"),
             "response": response_data.get("response", ""),
             "evaluation": evaluation,
             "metadata": response_data.get("metadata", {}),
-            "ground_truth": ground_truth
+            "ground_truth": ground_truth,
         }
 
     def _load_test_queries(self, path: str) -> List[Dict[str, Any]]:
-        """
-        Load test queries from JSON file.
-
-        TODO: YOUR CODE HERE
-        - Create test query dataset
-        - Load and validate queries
-        """
+        """Load test queries from JSON file."""
         path_obj = Path(path)
         if not path_obj.exists():
             self.logger.warning(f"Test queries file not found: {path}")
@@ -201,15 +173,7 @@ class SystemEvaluator:
         return queries
 
     def _generate_report(self) -> Dict[str, Any]:
-        """
-        Generate evaluation report with statistics and analysis.
-
-        TODO: YOUR CODE HERE
-        - Calculate aggregate statistics
-        - Identify best/worst performing queries
-        - Analyze errors
-        - Generate visualizations (optional)
-        """
+        """Generate evaluation report with statistics and analysis."""
         if not self.results:
             return {"error": "No results to report"}
 
@@ -224,13 +188,18 @@ class SystemEvaluator:
 
         for result in successful:
             evaluation = result.get("evaluation", {})
-            overall_scores.append(evaluation.get("overall_score", 0.0))
+            os_val = evaluation.get("overall_score")
+            if os_val is not None:
+                overall_scores.append(os_val)
 
-            # Collect scores by criterion
+            # Collect scores by criterion (skip None = transport failure)
             for criterion, score_data in evaluation.get("criterion_scores", {}).items():
+                sv = score_data.get("score")
+                if sv is None:
+                    continue
                 if criterion not in criterion_scores:
                     criterion_scores[criterion] = []
-                criterion_scores[criterion].append(score_data.get("score", 0.0))
+                criterion_scores[criterion].append(sv)
 
         # Calculate averages
         avg_overall = sum(overall_scores) / len(overall_scores) if overall_scores else 0.0
@@ -243,40 +212,59 @@ class SystemEvaluator:
         best_result = max(successful, key=lambda r: r.get("evaluation", {}).get("overall_score", 0.0)) if successful else None
         worst_result = min(successful, key=lambda r: r.get("evaluation", {}).get("overall_score", 0.0)) if successful else None
 
+        # Error analysis: lowest-scoring criterion, worst category
+        analysis_lines: List[str] = []
+        if avg_criterion_scores:
+            worst_crit = min(avg_criterion_scores.items(), key=lambda kv: kv[1])
+            best_crit = max(avg_criterion_scores.items(), key=lambda kv: kv[1])
+            analysis_lines.append(f"Lowest-scoring criterion: {worst_crit[0]} ({worst_crit[1]:.3f})")
+            analysis_lines.append(f"Highest-scoring criterion: {best_crit[0]} ({best_crit[1]:.3f})")
+
+        # Category-level breakdown
+        cat_scores: Dict[str, List[float]] = {}
+        for r in successful:
+            cat = r.get("category") or "uncategorized"
+            cat_scores.setdefault(cat, []).append(r.get("evaluation", {}).get("overall_score", 0.0))
+        cat_averages = {c: sum(v) / len(v) for c, v in cat_scores.items() if v}
+        if cat_averages:
+            worst_cat = min(cat_averages.items(), key=lambda kv: kv[1])
+            analysis_lines.append(
+                f"Weakest category: {worst_cat[0]} (avg {worst_cat[1]:.3f}, n={len(cat_scores[worst_cat[0]])})"
+            )
+        if failed:
+            analysis_lines.append(f"Failed queries ({len(failed)}):")
+            for r in failed[:5]:
+                analysis_lines.append(f"  - {r.get('query', '')[:60]}: {r.get('error', '')[:80]}")
+
         report = {
             "timestamp": datetime.now().isoformat(),
             "summary": {
                 "total_queries": total_queries,
                 "successful": len(successful),
                 "failed": len(failed),
-                "success_rate": len(successful) / total_queries if total_queries > 0 else 0.0
+                "success_rate": len(successful) / total_queries if total_queries > 0 else 0.0,
             },
             "scores": {
                 "overall_average": avg_overall,
-                "by_criterion": avg_criterion_scores
+                "by_criterion": avg_criterion_scores,
+                "by_category": cat_averages,
             },
             "best_result": {
                 "query": best_result.get("query", "") if best_result else "",
-                "score": best_result.get("evaluation", {}).get("overall_score", 0.0) if best_result else 0.0
+                "score": best_result.get("evaluation", {}).get("overall_score", 0.0) if best_result else 0.0,
             } if best_result else None,
             "worst_result": {
                 "query": worst_result.get("query", "") if worst_result else "",
-                "score": worst_result.get("evaluation", {}).get("overall_score", 0.0) if worst_result else 0.0
+                "score": worst_result.get("evaluation", {}).get("overall_score", 0.0) if worst_result else 0.0,
             } if worst_result else None,
-            "detailed_results": self.results
+            "error_analysis": "\n".join(analysis_lines),
+            "detailed_results": self.results,
         }
 
         return report
 
     def _save_results(self, report: Dict[str, Any]):
-        """
-        Save evaluation results to file.
-
-        TODO: YOUR CODE HERE
-        - Save detailed results
-        - Generate visualizations
-        - Create summary report
-        """
+        """Save evaluation results to file."""
         output_dir = Path("outputs")
         output_dir.mkdir(exist_ok=True)
 

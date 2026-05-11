@@ -1,0 +1,19 @@
+{
+  "query": "What are the key principles of explainable AI for novice users?",
+  "with_nli_off": {
+    "action": "allow",
+    "violation_count": 0,
+    "violations": []
+  },
+  "with_nli_on": {
+    "action": "sanitize",
+    "violation_count": 1,
+    "unsupported_claim_count": 1,
+    "unsupported_claims": [
+      {
+        "claim": "AI systems are being used in finance to detect credit risks and predict stock prices.",
+        "reason": "None of the provided sources explicitly discuss AI use in finance for credit risk detection or stock price prediction."
+      }
+    ]
+  }
+}

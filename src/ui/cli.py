@@ -16,23 +16,13 @@ import yaml
 import logging
 from dotenv import load_dotenv
 
-from src.autogen_orchestrator import AutoGenOrchestrator
+from src.orchestrator_factory import create_orchestrator
 
 # Load environment variables
 load_dotenv()
 
 class CLI:
-    """
-    Command-line interface for the research assistant.
-
-    TODO: YOUR CODE HERE
-    - Implement interactive prompt loop
-    - Display agent traces clearly
-    - Show citations and sources
-    - Indicate safety events (blocked/sanitized)
-    - Handle user commands (help, quit, clear, etc.)
-    - Format output nicely
-    """
+    """Command-line interface for the research assistant."""
 
     def __init__(self, config_path: str = "config.yaml"):
         """
@@ -48,11 +38,12 @@ class CLI:
         # Setup logging
         self._setup_logging()
 
-        # Initialize AutoGen orchestrator
+        # Initialize orchestrator (chosen via system.orchestrator in config.yaml)
         try:
-            self.orchestrator = AutoGenOrchestrator(self.config)
+            self.orchestrator = create_orchestrator(self.config)
             self.logger = logging.getLogger("cli")
-            self.logger.info("AutoGen orchestrator initialized successfully")
+            orch_name = self.config.get("system", {}).get("orchestrator", "autogen")
+            self.logger.info(f"{orch_name} orchestrator initialized successfully")
         except Exception as e:
             self.logger = logging.getLogger("cli")
             self.logger.error(f"Failed to initialize orchestrator: {e}")
@@ -60,6 +51,7 @@ class CLI:
 
         self.running = True
         self.query_count = 0
+        self._last_result = None
 
     def _setup_logging(self):
         """Setup logging configuration."""
@@ -76,16 +68,7 @@ class CLI:
         )
 
     async def run(self):
-        """
-        Main CLI loop.
-
-        TODO: YOUR CODE HERE
-        - Implement interactive loop
-        - Handle user input
-        - Process queries through orchestrator
-        - Display results
-        - Handle errors gracefully
-        """
+        """Main CLI loop."""
         self._print_welcome()
 
         while self.running:
@@ -109,20 +92,28 @@ class CLI:
                 elif query.lower() == 'stats':
                     self._print_stats()
                     continue
+                elif query.lower() == 'export':
+                    self._export_last_result()
+                    continue
+                elif query.lower() == 'traces':
+                    self.config.setdefault("ui", {})["verbose"] = not self.config.get("ui", {}).get("verbose", False)
+                    print(f"\nTraces {'ON' if self.config['ui']['verbose'] else 'OFF'}")
+                    continue
 
                 # Process query
                 print("\n" + "=" * 70)
                 print("Processing your query...")
                 print("=" * 70)
-                
+
                 try:
                     # Process through orchestrator (synchronous call, not async)
                     result = self.orchestrator.process_query(query)
                     self.query_count += 1
-                    
+                    self._last_result = result
+
                     # Display result
                     self._display_result(result)
-                    
+
                 except Exception as e:
                     print(f"\nError processing query: {e}")
                     logging.exception("Error processing query")
@@ -149,7 +140,9 @@ class CLI:
         print("\nAvailable commands:")
         print("  help    - Show this help message")
         print("  clear   - Clear the screen")
-        print("  stats   - Show system statistics")
+        print("  stats   - Show system statistics + safety stats")
+        print("  traces  - Toggle verbose agent traces")
+        print("  export  - Save last result as JSON + Markdown in outputs/")
         print("  quit    - Exit the application")
         print("\nOr enter a research query to get started!")
 
@@ -164,12 +157,83 @@ class CLI:
         os.system('clear' if os.name == 'posix' else 'cls')
 
     def _print_stats(self):
-        """Print system statistics."""
+        """Print system + safety statistics."""
         print("\nSystem Statistics:")
-        print(f"  Queries processed: {self.query_count}")
-        print(f"  System: {self.config.get('system', {}).get('name', 'Unknown')}")
-        print(f"  Topic: {self.config.get('system', {}).get('topic', 'Unknown')}")
-        print(f"  Model: {self.config.get('models', {}).get('default', {}).get('name', 'Unknown')}")
+        print(f"  Queries processed:  {self.query_count}")
+        print(f"  System:             {self.config.get('system', {}).get('name', 'Unknown')}")
+        print(f"  Topic:              {self.config.get('system', {}).get('topic', 'Unknown')}")
+        print(f"  Orchestrator:       {self.config.get('system', {}).get('orchestrator', 'autogen')}")
+        print(f"  Model:              {self.config.get('models', {}).get('default', {}).get('name', 'Unknown')}")
+        # Safety stats
+        sm = getattr(self.orchestrator, "safety_manager", None)
+        if sm:
+            stats = sm.get_safety_stats()
+            print(f"\nSafety Statistics:")
+            print(f"  Total checks:       {stats['total_events']}")
+            print(f"  Input checks:       {stats['input_checks']}")
+            print(f"  Output checks:      {stats['output_checks']}")
+            print(f"  Violations:         {stats['violations']}")
+            print(f"  Violation rate:     {stats['violation_rate']:.1%}")
+
+    def _export_last_result(self):
+        """Save the last query result as JSON + Markdown in outputs/."""
+        if not self._last_result:
+            print("\nNo result to export yet. Run a query first.")
+            return
+        from datetime import datetime
+        from pathlib import Path
+        import json
+        outdir = Path("outputs")
+        outdir.mkdir(exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        json_path = outdir / f"session_{ts}.json"
+        md_path = outdir / f"answer_{ts}.md"
+
+        # JSON: full session
+        with open(json_path, "w") as f:
+            json.dump(self._last_result, f, indent=2, default=str)
+
+        # Markdown: query + answer + citations + safety summary
+        md = self._render_markdown(self._last_result)
+        with open(md_path, "w") as f:
+            f.write(md)
+
+        print(f"\n✅ Exported:")
+        print(f"   {json_path}")
+        print(f"   {md_path}")
+
+    def _render_markdown(self, result):
+        """Build a clean Markdown view of a result for export."""
+        from datetime import datetime
+        md = []
+        md.append(f"# Research Answer\n")
+        md.append(f"_Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}_\n")
+        md.append(f"## Query\n{result.get('query', '')}\n")
+        md.append(f"## Answer\n{result.get('response', '')}\n")
+        metadata = result.get("metadata", {}) or {}
+        # Citations
+        citations = self._extract_citations(result)
+        if citations:
+            md.append("## Citations\n")
+            for i, c in enumerate(citations, 1):
+                md.append(f"{i}. {c}")
+            md.append("")
+        # Metadata
+        md.append("## Metadata\n")
+        md.append(f"- Messages exchanged: {metadata.get('num_messages', 0)}")
+        md.append(f"- Sources gathered:   {metadata.get('num_sources', 0)}")
+        md.append(f"- Agents involved:    {', '.join(metadata.get('agents_involved', []))}")
+        md.append(f"- Orchestrator:       {metadata.get('orchestrator', self.config.get('system', {}).get('orchestrator', 'autogen'))}")
+        md.append("")
+        # Safety
+        events = metadata.get("safety_events", [])
+        if events:
+            md.append("## Safety Events\n")
+            for ev in events:
+                cats = ev.get("policy_categories") or ["none"]
+                md.append(f"- **{ev.get('type', '').upper()}** action=`{ev.get('action', '')}` categories=`{', '.join(cats)}` event_id=`{ev.get('event_id', '')[:8]}`")
+            md.append("")
+        return "\n".join(md)
 
     def _display_result(self, result: Dict[str, Any]):
         """Display query result with formatting."""
@@ -204,11 +268,25 @@ class CLI:
             print(f"  • Messages exchanged: {metadata.get('num_messages', 0)}")
             print(f"  • Sources gathered: {metadata.get('num_sources', 0)}")
             print(f"  • Agents involved: {', '.join(metadata.get('agents_involved', []))}")
-            # TODO: Display safety events and refusal/sanitization status here
-            # Suggested implementation:
-            # - Read safety metadata returned by the orchestrator
-            # - Print which policy category was triggered
-            # - Show whether the response was refused or sanitized
+            orch_label = metadata.get('orchestrator') or self.config.get('system', {}).get('orchestrator', 'autogen')
+            print(f"  • Orchestrator: {orch_label}")
+
+        # Display safety events
+        safety_events = (metadata or {}).get("safety_events", [])
+        if safety_events:
+            print("\n" + "-" * 70)
+            print("🛡️  SAFETY")
+            print("-" * 70)
+            for ev in safety_events:
+                cats = ev.get("policy_categories") or []
+                cat_str = ", ".join(cats) if cats else "none"
+                icon = "✅" if ev.get("action") == "allow" else "⚠️ "
+                print(f"  {icon} {ev.get('type', '').upper():6s}  action={ev.get('action', ''):9s}  categories=[{cat_str}]")
+                # Surface short reasons for any violations
+                for v in (ev.get("violations") or [])[:3]:
+                    print(f"        - {v.get('category', '')}: {v.get('reason', '')[:80]}")
+            if metadata.get("blocked_by_safety"):
+                print(f"\n  ❌ This query was blocked at input — no agent ran.")
 
         # Display conversation summary if verbose mode
         if self._should_show_traces():

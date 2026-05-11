@@ -10,6 +10,23 @@ from typing import List, Dict, Any, Optional
 import os
 import logging
 import asyncio
+import concurrent.futures
+
+
+def _run_coro_safely(coro):
+    """Run an async coroutine from sync code, even when an event loop is active.
+
+    `asyncio.run()` raises if a loop is already running (e.g., inside LangGraph
+    nodes). Detect that case and execute the coroutine in a fresh thread with
+    its own loop.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    # A loop is already running — offload to a worker thread
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()
 
 
 class WebSearchTool:
@@ -225,7 +242,7 @@ def web_search(query: str, provider: str = "tavily", max_results: int = 5) -> st
         Formatted string with search results
     """
     tool = WebSearchTool(provider=provider, max_results=max_results)
-    results = asyncio.run(tool.search(query))
+    results = _run_coro_safely(tool.search(query))
     
     if not results:
         return "No search results found."

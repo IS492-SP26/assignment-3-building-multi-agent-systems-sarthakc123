@@ -13,9 +13,11 @@ Workflow:
 
 import logging
 import asyncio
+import re
 from typing import Dict, Any, List, Optional
 
 from src.agents.autogen_agents import create_research_team
+from src.guardrails.safety_manager import SafetyManager
 
 
 class AutoGenOrchestrator:
@@ -36,13 +38,17 @@ class AutoGenOrchestrator:
         """
         self.config = config
         self.logger = logging.getLogger("autogen_orchestrator")
-        
+
+        # Initialize safety manager (always present so the UI can read events;
+        # it no-ops when safety.enabled is false).
+        self.safety_manager = SafetyManager(config)
+
         # Create the research team
         self.logger.info("Creating research team...")
         self.team = create_research_team(config)
-        
+
         self.logger.info("Research team created successfully")
-        
+
         # Workflow trace for debugging and UI display
         self.workflow_trace: List[Dict[str, Any]] = []
 
@@ -62,7 +68,34 @@ class AutoGenOrchestrator:
             - metadata: Additional information about the process
         """
         self.logger.info(f"Processing query: {query}")
-        
+
+        # ---- 1. Input safety check (block before agent loop) ----
+        input_check = self.safety_manager.check_input_safety(query)
+        if not input_check["safe"]:
+            self.logger.warning(
+                f"Query blocked by input guardrail: {input_check['policy_categories']}"
+            )
+            return {
+                "query": query,
+                "response": input_check["message"],
+                "conversation_history": [],
+                "metadata": {
+                    "num_messages": 0,
+                    "num_sources": 0,
+                    "agents_involved": [],
+                    "blocked_by_safety": True,
+                    "safety_events": [
+                        {
+                            "type": "input",
+                            "action": input_check["action"],
+                            "policy_categories": input_check["policy_categories"],
+                            "violations": input_check["violations"],
+                            "event_id": input_check["event_id"],
+                        }
+                    ],
+                },
+            }
+
         try:
             # Run the async query processing
             loop = asyncio.get_event_loop()
@@ -71,12 +104,38 @@ class AutoGenOrchestrator:
                 import concurrent.futures
                 with concurrent.futures.ThreadPoolExecutor() as pool:
                     result = pool.submit(
-                        asyncio.run, 
+                        asyncio.run,
                         self._process_query_async(query, max_rounds)
                     ).result()
             else:
                 result = loop.run_until_complete(self._process_query_async(query, max_rounds))
-            
+
+            # ---- 2. Output safety check on the final synthesized response ----
+            sources = self._collect_sources(result.get("conversation_history", []))
+            output_check = self.safety_manager.check_output_safety(
+                result.get("response", ""),
+                sources=sources,
+            )
+            result["response"] = output_check["response"]
+            result.setdefault("metadata", {})
+            result["metadata"]["safety_events"] = [
+                {
+                    "type": "input",
+                    "action": input_check["action"],
+                    "policy_categories": input_check["policy_categories"],
+                    "violations": input_check["violations"],
+                    "event_id": input_check["event_id"],
+                },
+                {
+                    "type": "output",
+                    "action": output_check["action"],
+                    "policy_categories": output_check["policy_categories"],
+                    "violations": output_check["violations"],
+                    "event_id": output_check["event_id"],
+                },
+            ]
+            result["metadata"]["sources"] = sources
+
             self.logger.info("Query processing complete")
             return result
             
@@ -112,28 +171,40 @@ Please work together to answer this query comprehensively:
         
         # Run the team
         result = await self.team.run(task=task_message)
-        
-        # Extract conversation history
+
+        # Extract conversation history. Handle both sync (list) and async-iterable
+        # forms returned by different AutoGen versions.
         messages = []
-        async for message in result.messages:
-            msg_dict = {
-                "source": message.source,
-                "content": message.content if hasattr(message, 'content') else str(message),
-            }
-            messages.append(msg_dict)
+        raw_messages = getattr(result, "messages", []) or []
+        if hasattr(raw_messages, "__aiter__"):
+            async for message in raw_messages:
+                messages.append({
+                    "source": getattr(message, "source", "Unknown"),
+                    "content": getattr(message, "content", str(message)),
+                })
+        else:
+            for message in raw_messages:
+                messages.append({
+                    "source": getattr(message, "source", "Unknown"),
+                    "content": getattr(message, "content", str(message)),
+                })
         
-        # Extract final response
+        # Extract final response. Prefer the Writer's last message (the actual
+        # synthesized answer). Fall back to Critic if no Writer message, then to
+        # the most recent message of any kind.
         final_response = ""
         if messages:
-            # Get the last message from Writer or Critic
             for msg in reversed(messages):
-                if msg.get("source") in ["Writer", "Critic"]:
+                if msg.get("source") == "Writer":
                     final_response = msg.get("content", "")
                     break
-        
-        # If no response found, use the last message
-        if not final_response and messages:
-            final_response = messages[-1].get("content", "")
+            if not final_response:
+                for msg in reversed(messages):
+                    if msg.get("source") == "Critic":
+                        final_response = msg.get("content", "")
+                        break
+            if not final_response:
+                final_response = messages[-1].get("content", "")
         
         return self._extract_results(query, messages, final_response)
 
@@ -190,6 +261,23 @@ Please work together to answer this query comprehensively:
                 "agents_involved": list(set([msg.get("source", "") for msg in messages])),
             }
         }
+
+    @staticmethod
+    def _collect_sources(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Pull source titles/URLs out of the Researcher's tool-result messages
+        so the OutputGuardrail can ground citations against them.
+        """
+        sources: List[Dict[str, Any]] = []
+        url_re = re.compile(r"https?://[^\s<>\"{}|\\^\[\]]+")
+        for msg in messages:
+            content = msg.get("content") or ""
+            if not isinstance(content, str):
+                continue
+            for url in url_re.findall(content):
+                if not any(s.get("url") == url for s in sources):
+                    sources.append({"url": url, "title": "", "snippet": content[:200]})
+        return sources
 
     def get_agent_descriptions(self) -> Dict[str, str]:
         """

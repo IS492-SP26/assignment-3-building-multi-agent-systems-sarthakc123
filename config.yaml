@@ -4,8 +4,9 @@
 system:
   name: "Multi-Agent Research Assistant"
   topic: "HCI Research"  # Change this to your chosen topic
-  max_iterations: 10
+  max_iterations: 3     # Critic revision loop cap (was 10 — caused 5x runs)
   timeout_seconds: 300
+  orchestrator: "langgraph"  # "autogen" or "langgraph"
 
 agents:
   planner:
@@ -62,19 +63,37 @@ agents:
     #   Say "APPROVED - RESEARCH COMPLETE" or "NEEDS REVISION".
 
 models:
-  # Default model for agents (Groq)
+  # Default model for agents (Groq, supports native tool calling).
+  # llama-3.1-8b-instant is fast + has a generous separate daily quota.
+  # Upgrade to llama-3.3-70b-versatile for higher quality if quota allows.
   default:
-    provider: "vllm"
-    name: "openai/gpt-oss-20b"
+    provider: "groq"
+    name: "llama-3.1-8b-instant"
     temperature: 0.7
-    max_tokens: 2048
+    max_tokens: 1024
 
-  # Judge model for evaluation
+  # Judge model for evaluation — intentionally a DIFFERENT model family than the
+  # agents to reduce correlated errors and avoid self-evaluation bias.
+  # Agents use Meta's Llama 3.3 70B; judge uses an OpenAI architecture (gpt-oss 120B).
   judge:
-    provider: "vllm"
-    name: "openai/gpt-oss-20b"
+    provider: "groq"
+    name: "openai/gpt-oss-120b"
     temperature: 0.3
     max_tokens: 1024
+
+  # Alternative: assignment-provided vLLM endpoint (Qwen/Qwen3-8B).
+  # NOTE: this server does not currently accept tool/function calls,
+  # so the Researcher agent's tools won't work on this path.
+  # default:
+  #   provider: "vllm"
+  #   name: "Qwen/Qwen3-8B"
+  #   temperature: 0.7
+  #   max_tokens: 2048
+  # judge:
+  #   provider: "vllm"
+  #   name: "Qwen/Qwen3-8B"
+  #   temperature: 0.3
+  #   max_tokens: 1024
 
 tools:
   web_search:
@@ -83,26 +102,45 @@ tools:
     max_results: 5
 
   paper_search:
-    enabled: true
+    enabled: false        # Semantic Scholar free tier is heavily rate-limited (429s
+                          # take minutes to back off). Tavily web search picks up
+                          # NIST/ACM/arXiv PDFs anyway. Re-enable for paper-heavy queries.
     provider: "semantic_scholar"
-    max_results: 10
+    max_results: 5
 
   citation_extraction:
     enabled: true
 
 safety:
   enabled: true
-  framework: "guardrails"  # or "nemo_guardrails"
+  framework: "custom"  # "custom", "guardrails", "nemo_guardrails"
   log_events: true
+  safety_log_file: "logs/safety_events.log"
 
-  # Define prohibited categories
+  # Optional secondary layers
+  use_llm_classifier: false  # if true, uses Groq for harmful content classification
+  use_nemo: false             # if true, runs NeMo Guardrails as additional layer
+  # NLI-based hallucination detection (bonus innovation).
+  # Default OFF for interactive UI speed (~3 min faster per query).
+  # Flip to true to demonstrate the feature end-to-end; ablation evidence
+  # captured in outputs/sample_nli_ablation.json regardless.
+  use_nli_check: false
+  nli_max_claims: 6           # cap on claims extracted per response (cost control)
+
+  # Input length thresholds
+  min_query_length: 5
+  max_query_length: 2000
+
+  # Define prohibited categories (6 policy categories with default actions)
   prohibited_categories:
-    - "harmful_content"
-    - "personal_attacks"
-    - "misinformation"
-    - "off_topic_queries"
+    - "prompt_injection"     # action: refuse
+    - "harmful_content"      # action: refuse
+    - "pii"                  # action: sanitize (redact)
+    - "off_topic"            # action: redirect
+    - "misinformation_risk"  # action: sanitize/flag (string-match grounding)
+    - "unsupported_claim"    # action: sanitize/annotate (NLI-based grounding)
 
-  # Response strategies
+  # Default response strategy when category-specific action not given
   on_violation:
     action: "refuse"  # or "sanitize" or "redirect"
     message: "I cannot process this request due to safety policies."

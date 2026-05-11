@@ -1,128 +1,149 @@
 """
 LLM-as-a-Judge
-Uses LLMs to evaluate system outputs based on defined criteria.
 
-Example usage:
-    # Initialize judge with config
-    judge = LLMJudge(config)
-    
-    # Evaluate a response
-    result = await judge.evaluate(
-        query="What is the capital of France?",
-        response="Paris is the capital of France.",
-        sources=[],
-        ground_truth="Paris"
-    )
-    
-    print(f"Overall Score: {result['overall_score']}")
-    print(f"Criterion Scores: {result['criterion_scores']}")
+Evaluates system outputs with two INDEPENDENT judging perspectives:
+
+  Perspective A — Rubric Judge:
+      One LLM call per criterion defined in config.yaml. Each call returns a
+      structured 0.0–1.0 score and reasoning. Aggregated by weight.
+
+  Perspective B — Holistic Judge:
+      A single LLM call that asks the judge to play the role of a graduate-
+      student peer reviewer and assign one 1–10 composite score with rationale.
+
+The two perspectives use different prompt designs so their errors are not
+correlated. The final `overall_score` is the weighted average of (A) and
+(B normalized to 0–1).
+
+Raw judge prompts and responses are saved to `outputs/judge_traces/` so the
+grader can inspect at least one representative query's prompt/output.
 """
 
-from typing import Dict, Any, List, Optional
-import logging
+from __future__ import annotations
+
 import json
+import logging
 import os
-from groq import Groq
+import re
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from openai import OpenAI
+
+
+# ---- Rubric anchors used in the per-criterion prompt ------------------------
+
+RUBRIC_ANCHORS = """
+Scoring scale (anchor each score to the closest description):
+  1.00 – Excellent: fully addresses the criterion, no meaningful weakness.
+  0.75 – Good: addresses the criterion well, minor gaps.
+  0.50 – Adequate: partially addresses the criterion, notable gaps.
+  0.25 – Weak: barely addresses the criterion, major issues.
+  0.00 – Fails: does not address the criterion at all.
+"""
 
 
 class LLMJudge:
-    """
-    LLM-based judge for evaluating system responses.
-
-    TODO: YOUR CODE HERE
-    - Implement LLM API calls for judging
-    - Create judge prompts for each criterion
-    - Parse judge responses into scores
-    - Aggregate scores across multiple criteria
-    - Handle multiple judges/perspectives
-    """
+    """LLM-based judge with two independent evaluation perspectives."""
 
     def __init__(self, config: Dict[str, Any]):
-        """
-        Initialize LLM judge.
-
-        Args:
-            config: Configuration dictionary (from config.yaml)
-        """
         self.config = config
         self.logger = logging.getLogger("evaluation.judge")
 
-        # Load judge model configuration from config.yaml (models.judge)
-        # This includes: provider, name, temperature, max_tokens
+        # Judge model config (independent from agent model in config.yaml)
         self.model_config = config.get("models", {}).get("judge", {})
+        self.criteria: List[Dict[str, Any]] = (
+            config.get("evaluation", {}).get("criteria", [])
+        )
 
-        # Load evaluation criteria from config.yaml (evaluation.criteria)
-        # Each criterion has: name, weight, description
-        self.criteria = config.get("evaluation", {}).get("criteria", [])
-        
-        # Initialize Groq client (similar to what we tried in Lab 5)
-        api_key = os.getenv("GROQ_API_KEY")
-        if not api_key:
-            self.logger.warning("GROQ_API_KEY not found in environment")
-        self.client = Groq(api_key=api_key) if api_key else None
-        
-        self.logger.info(f"LLMJudge initialized with {len(self.criteria)} criteria")
- 
+        # OpenAI-compatible client (works with Groq, OpenAI, or vLLM)
+        self.client = self._make_client()
+        self.model_name = self.model_config.get("name", "llama-3.3-70b-versatile")
+        self.temperature = float(self.model_config.get("temperature", 0.3))
+        self.max_tokens = int(self.model_config.get("max_tokens", 1024))
+
+        # Where to dump raw judge prompts + responses (for grading transparency)
+        self.trace_dir = Path("outputs/judge_traces")
+        self.trace_dir.mkdir(parents=True, exist_ok=True)
+        self._trace_seq = 0  # used when no query_id is provided
+
+        self.logger.info(
+            f"LLMJudge initialized — {len(self.criteria)} criteria, "
+            f"model={self.model_name}"
+        )
+
+    # ---- Public API ---------------------------------------------------------
+
     async def evaluate(
         self,
         query: str,
         response: str,
         sources: Optional[List[Dict[str, Any]]] = None,
-        ground_truth: Optional[str] = None
+        ground_truth: Optional[str] = None,
+        query_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Evaluate a response using LLM-as-a-Judge.
-
-        Args:
-            query: The original query
-            response: The system's response
-            sources: Sources used in the response
-            ground_truth: Optional ground truth/expected response
+        Evaluate a response using both judging perspectives.
 
         Returns:
-            Dictionary with scores for each criterion and overall score
-
-        TODO: YOUR CODE HERE
-        - Implement LLM API calls
-        - Call judge for each criterion
-        - Parse and aggregate scores
-        - Provide detailed feedback
+            {
+              "query": str,
+              "overall_score": float,                       # 0..1
+              "criterion_scores": {name: {score, reasoning}}, # perspective A
+              "holistic": {score, normalized, reasoning},     # perspective B
+              "feedback": [str, ...],
+            }
         """
-        self.logger.info(f"Evaluating response for query: {query[:50]}...")
-
-        results = {
+        results: Dict[str, Any] = {
             "query": query,
             "overall_score": 0.0,
             "criterion_scores": {},
             "feedback": [],
         }
 
-        total_weight = sum(c.get("weight", 1.0) for c in self.criteria)
-        weighted_score = 0.0
-
-        # Evaluate each criterion
+        # ---- Perspective A: per-criterion rubric judge --------------------
+        # Skip criteria whose judge call failed (score=None) so they don't drag
+        # the average down. Track how many succeeded for transparency.
+        weighted_sum = 0.0
+        weight_used = 0.0
+        n_failed = 0
         for criterion in self.criteria:
-            criterion_name = criterion.get("name", "unknown")
-            weight = criterion.get("weight", 1.0)
-
-            self.logger.info(f"Evaluating criterion: {criterion_name}")
-
-            # TODO: Implement actual LLM judging
-            score = await self._judge_criterion(
-                criterion=criterion,
-                query=query,
-                response=response,
-                sources=sources,
-                ground_truth=ground_truth
+            cname = criterion.get("name", "unknown")
+            w = float(criterion.get("weight", 1.0))
+            score_obj = await self._judge_criterion(
+                criterion, query, response, sources, ground_truth, query_id
             )
+            results["criterion_scores"][cname] = score_obj
+            score_val = score_obj.get("score")
+            if score_val is None:
+                n_failed += 1
+                continue
+            weighted_sum += score_val * w
+            weight_used += w
+            if score_obj.get("reasoning"):
+                results["feedback"].append(f"{cname}: {score_obj['reasoning']}")
+        rubric_overall = (weighted_sum / weight_used) if weight_used else 0.0
+        results["n_criteria_failed"] = n_failed
 
-            results["criterion_scores"][criterion_name] = score
-            weighted_score += score.get("score", 0.0) * weight
+        # ---- Perspective B: holistic peer-reviewer judge ------------------
+        holistic = await self._judge_holistic(
+            query, response, sources, ground_truth, query_id
+        )
+        results["holistic"] = holistic
 
-        # Calculate overall score
-        results["overall_score"] = weighted_score / total_weight if total_weight > 0 else 0.0
-
+        # ---- Aggregate: average of rubric and holistic-normalized --------
+        # If holistic failed, fall back to rubric alone (no zero pollution).
+        hol_norm = holistic.get("normalized")
+        if hol_norm is None:
+            results["overall_score"] = rubric_overall
+            results["aggregation_note"] = "holistic judge failed — using rubric only"
+        else:
+            results["overall_score"] = (rubric_overall + hol_norm) / 2.0
+        results["rubric_overall"] = rubric_overall
         return results
+
+    # ---- Perspective A: rubric judge ---------------------------------------
 
     async def _judge_criterion(
         self,
@@ -130,309 +151,234 @@ class LLMJudge:
         query: str,
         response: str,
         sources: Optional[List[Dict[str, Any]]],
-        ground_truth: Optional[str]
+        ground_truth: Optional[str],
+        query_id: Optional[str],
     ) -> Dict[str, Any]:
-        """
-        Judge a single criterion.
-
-        Args:
-            criterion: Criterion configuration
-            query: Original query
-            response: System response
-            sources: Sources used
-            ground_truth: Optional ground truth
-
-        Returns:
-            Score and feedback for this criterion
-
-        This is a basic implementation using Groq API.
-        """
-        criterion_name = criterion.get("name", "unknown")
+        cname = criterion.get("name", "unknown")
         description = criterion.get("description", "")
-
-        # Create judge prompt
-        prompt = self._create_judge_prompt(
-            criterion_name=criterion_name,
-            description=description,
-            query=query,
-            response=response,
-            sources=sources,
-            ground_truth=ground_truth
+        prompt = self._build_rubric_prompt(
+            cname, description, query, response, sources, ground_truth
         )
+        raw = self._call_llm(
+            system_prompt=(
+                "You are an expert evaluator for academic research outputs. "
+                "Respond in strict JSON with keys `score` (0.0–1.0 float) and "
+                "`reasoning` (concise explanation)."
+            ),
+            user_prompt=prompt,
+        )
+        self._save_trace(
+            query_id=query_id,
+            perspective="rubric",
+            criterion=cname,
+            prompt=prompt,
+            raw_response=raw,
+        )
+        score, reasoning = self._parse_judgment(raw)
+        return {"score": score, "reasoning": reasoning, "criterion": cname}
 
-        # Call LLM API to get judgment
-        try:
-            judgment = await self._call_judge_llm(prompt)
-            score_value, reasoning = self._parse_judgment(judgment)
-            
-            score = {
-                "score": score_value,  # 0-1 scale
-                "reasoning": reasoning,
-                "criterion": criterion_name
-            }
-        except Exception as e:
-            self.logger.error(f"Error judging criterion {criterion_name}: {e}")
-            score = {
-                "score": 0.0,
-                "reasoning": f"Error during evaluation: {str(e)}",
-                "criterion": criterion_name
-            }
-
-        return score
-
-    def _create_judge_prompt(
+    def _build_rubric_prompt(
         self,
         criterion_name: str,
         description: str,
         query: str,
         response: str,
         sources: Optional[List[Dict[str, Any]]],
-        ground_truth: Optional[str]
+        ground_truth: Optional[str],
     ) -> str:
-        """
-        Create a prompt for the judge LLM.
+        sources_block = ""
+        if sources:
+            sources_block = "<sources>\n"
+            for i, s in enumerate(sources[:10], 1):
+                if isinstance(s, dict):
+                    title = s.get("title") or ""
+                    url = s.get("url") or ""
+                    sources_block += f"  {i}. {title} {url}\n"
+                else:
+                    sources_block += f"  {i}. {s}\n"
+            sources_block += "</sources>\n\n"
 
-        TODO: YOUR CODE HERE
-        - Create effective judge prompts
-        - Include clear scoring rubric
-        - Provide examples if helpful
-        """
-        prompt = f"""You are an expert evaluator. Evaluate the following response based on the criterion: {criterion_name}.
+        gt_block = f"<ground_truth>\n{ground_truth}\n</ground_truth>\n\n" if ground_truth else ""
 
-Criterion Description: {description}
+        return f"""Evaluate the response below on a SINGLE criterion.
+
+<criterion>
+  name: {criterion_name}
+  description: {description}
+</criterion>
+
+{RUBRIC_ANCHORS}
+
+<query>
+{query}
+</query>
+
+<response>
+{response}
+</response>
+
+{sources_block}{gt_block}Return ONLY a JSON object:
+{{"score": <float 0.0-1.0>, "reasoning": "<one short paragraph>"}}
+"""
+
+    # ---- Perspective B: holistic peer-reviewer judge -----------------------
+
+    async def _judge_holistic(
+        self,
+        query: str,
+        response: str,
+        sources: Optional[List[Dict[str, Any]]],
+        ground_truth: Optional[str],
+        query_id: Optional[str],
+    ) -> Dict[str, Any]:
+        n_sources = len(sources or [])
+        gt_block = f"\n\nExpected/ground-truth context: {ground_truth}" if ground_truth else ""
+
+        prompt = f"""You are a graduate-student peer reviewer evaluating an academic research response.
+
+Read the query and the response. Rate it from 1 to 10 on the **combined** axes of:
+  - coverage of the question,
+  - accuracy of factual claims,
+  - quality and proper use of citations,
+  - clarity of writing.
+
+Be calibrated: a 10/10 response is essentially flawless; a 5/10 is acceptable but
+unremarkable; a 1/10 is unhelpful or incorrect.
 
 Query: {query}
 
 Response:
 {response}
+
+Number of cited sources: {n_sources}{gt_block}
+
+Return ONLY a JSON object:
+{{"score": <integer 1-10>, "reasoning": "<2-3 sentences>"}}
 """
-
-        if sources:
-            prompt += f"\n\nSources Used: {len(sources)} sources"
-
-        if ground_truth:
-            prompt += f"\n\nExpected Response:\n{ground_truth}"
-
-        prompt += """
-
-Please evaluate the response on a scale of 0.0 to 1.0 for this criterion.
-Provide your evaluation in the following JSON format:
-{
-    "score": <float between 0.0 and 1.0>,
-    "reasoning": "<detailed explanation of your score>"
-}
-"""
-
-        return prompt
-
-    async def _call_judge_llm(self, prompt: str) -> str:
-        """
-        Call LLM API to get judgment.
-        Uses model configuration from config.yaml (models.judge section).
-        """
-        if not self.client:
-            raise ValueError("Groq client not initialized. Check GROQ_API_KEY environment variable.")
-        
-        try:
-            # Load model settings from config.yaml (models.judge)
-            model_name = self.model_config.get("name", "llama-3.1-8b-instant")
-            temperature = self.model_config.get("temperature", 0.3)
-            max_tokens = self.model_config.get("max_tokens", 1024)
-            
-            self.logger.debug(f"Calling Groq API with model: {model_name}")
-            
-            # Call Groq API (pattern from Lab 5)
-            chat_completion = self.client.chat.completions.create(
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are an expert evaluator. Provide your evaluations in valid JSON format."
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ],
-                model=model_name,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-            
-            response = chat_completion.choices[0].message.content
-            self.logger.debug(f"Received response: {response[:100]}...")
-            
-            return response
-            
-        except Exception as e:
-            self.logger.error(f"Error calling Groq API: {e}")
-            raise
-
-    def _parse_judgment(self, judgment: str) -> tuple:
-        """
-        Parse LLM judgment response.
-        
-        """
-        try:
-            # Clean up the response - remove markdown code blocks if present
-            judgment_clean = judgment.strip()
-            if judgment_clean.startswith("```json"):
-                judgment_clean = judgment_clean[7:]
-            elif judgment_clean.startswith("```"):
-                judgment_clean = judgment_clean[3:]
-            if judgment_clean.endswith("```"):
-                judgment_clean = judgment_clean[:-3]
-            judgment_clean = judgment_clean.strip()
-
-            # Parse JSON
-            result = json.loads(judgment_clean)
-            score = float(result.get("score", 0.0))
-            reasoning = result.get("reasoning", "")
-            
-            # Validate score is in range [0, 1]
-            score = max(0.0, min(1.0, score))
-            
-            return score, reasoning
-            
-        except json.JSONDecodeError as e:
-            self.logger.error(f"JSON decode error: {e}")
-            self.logger.error(f"Raw judgment: {judgment[:200]}")
-            return 0.0, f"Error parsing judgment: Invalid JSON"
-        except Exception as e:
-            self.logger.error(f"Error parsing judgment: {e}")
-            return 0.0, f"Error parsing judgment: {str(e)}"
-
-
-
-async def example_basic_evaluation():
-    """
-    Example 1: Basic evaluation with LLMJudge
-    
-    Usage:
-        import asyncio
-        from src.evaluation.judge import example_basic_evaluation
-        asyncio.run(example_basic_evaluation())
-    """
-    import yaml
-    from dotenv import load_dotenv
-    
-    load_dotenv()
-    
-    # Load config
-    with open("config.yaml", 'r') as f:
-        config = yaml.safe_load(f)
-    
-    # Initialize judge
-    judge = LLMJudge(config)
-    
-    # Test case (similar to Lab 5)
-    print("=" * 70)
-    print("EXAMPLE 1: Basic Evaluation")
-    print("=" * 70)
-    
-    query = "What is the capital of France?"
-    response = "Paris is the capital of France. It is known for the Eiffel Tower."
-    ground_truth = "Paris"
-    
-    print(f"\nQuery: {query}")
-    print(f"Response: {response}")
-    print(f"Ground Truth: {ground_truth}\n")
-    
-    # Evaluate
-    result = await judge.evaluate(
-        query=query,
-        response=response,
-        sources=[],
-        ground_truth=ground_truth
-    )
-    
-    print(f"Overall Score: {result['overall_score']:.3f}\n")
-    print("Criterion Scores:")
-    for criterion, score_data in result['criterion_scores'].items():
-        print(f"  {criterion}: {score_data['score']:.3f}")
-        print(f"    Reasoning: {score_data['reasoning'][:100]}...")
-        print()
-
-
-async def example_compare_responses():
-    """
-    Example 2: Compare multiple responses
-    
-    Usage:
-        import asyncio
-        from src.evaluation.judge import example_compare_responses
-        asyncio.run(example_compare_responses())
-    """
-    import yaml
-    from dotenv import load_dotenv
-    
-    load_dotenv()
-    
-    # Load config
-    with open("config.yaml", 'r') as f:
-        config = yaml.safe_load(f)
-    
-    # Initialize judge
-    judge = LLMJudge(config)
-    
-    print("=" * 70)
-    print("EXAMPLE 2: Compare Multiple Responses")
-    print("=" * 70)
-    
-    query = "What causes climate change?"
-    ground_truth = "Climate change is primarily caused by increased greenhouse gas emissions from human activities, including burning fossil fuels, deforestation, and industrial processes."
-    
-    responses = [
-        "Climate change is primarily caused by greenhouse gas emissions from human activities.",
-        "The weather changes because of natural cycles and the sun's activity.",
-        "Climate change is a complex phenomenon involving multiple factors including CO2 emissions, deforestation, and industrial processes."
-    ]
-    
-    print(f"\nQuery: {query}\n")
-    print(f"Ground Truth: {ground_truth}\n")
-    
-    results = []
-    for i, response in enumerate(responses, 1):
-        print(f"\n{'='*70}")
-        print(f"Response {i}:")
-        print(f"{response}")
-        print(f"{'='*70}")
-        
-        result = await judge.evaluate(
-            query=query,
-            response=response,
-            sources=[],
-            ground_truth=ground_truth
+        raw = self._call_llm(
+            system_prompt=(
+                "You are a careful, well-calibrated peer reviewer. Always respond "
+                "in strict JSON."
+            ),
+            user_prompt=prompt,
         )
-        
-        results.append(result)
-        
-        print(f"\nOverall Score: {result['overall_score']:.3f}")
-        print("\nCriterion Scores:")
-        for criterion, score_data in result['criterion_scores'].items():
-            print(f"  {criterion}: {score_data['score']:.3f}")
-        print()
-    
-    # Summary
-    print("\n" + "=" * 70)
-    print("SUMMARY")
-    print("=" * 70)
-    for i, result in enumerate(results, 1):
-        print(f"Response {i}: {result['overall_score']:.3f}")
-    
-    best_idx = max(range(len(results)), key=lambda i: results[i]['overall_score'])
-    print(f"\nBest Response: Response {best_idx + 1}")
+        self._save_trace(
+            query_id=query_id,
+            perspective="holistic",
+            criterion="holistic",
+            prompt=prompt,
+            raw_response=raw,
+        )
+        raw_score, reasoning = self._parse_judgment(raw, score_range=(1.0, 10.0))
+        return {
+            "score": raw_score,                                     # 1..10 or None
+            "normalized": (raw_score / 10.0) if raw_score is not None else None,
+            "reasoning": reasoning,
+        }
 
+    # ---- LLM client + parsing ---------------------------------------------
 
-# For direct execution
-if __name__ == "__main__":
-    import asyncio
-    
-    print("Running LLMJudge Examples\n")
-    
-    # Run example 1
-    asyncio.run(example_basic_evaluation())
-    
-    print("\n\n")
-    
-    # Run example 2
-    asyncio.run(example_compare_responses())
+    def _make_client(self) -> OpenAI:
+        provider = self.model_config.get("provider", "groq")
+        if provider == "groq":
+            api_key = os.getenv("GROQ_API_KEY")
+            if not api_key:
+                raise ValueError("GROQ_API_KEY not found in environment for judge")
+            return OpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
+        if provider == "openai":
+            api_key = os.getenv("OPENAI_API_KEY")
+            base_url = os.getenv("OPENAI_BASE_URL")
+            return OpenAI(api_key=api_key, base_url=base_url) if base_url else OpenAI(api_key=api_key)
+        if provider == "vllm":
+            api_key = os.getenv("OPENAI_API_KEY")
+            base_url = os.getenv("OPENAI_BASE_URL")
+            if not api_key or not base_url:
+                raise ValueError("OPENAI_API_KEY and OPENAI_BASE_URL required for vllm judge")
+            return OpenAI(api_key=api_key, base_url=base_url)
+        raise ValueError(f"Unsupported judge provider: {provider}")
+
+    def _call_llm(self, system_prompt: str, user_prompt: str, retries: int = 2) -> str:
+        """Call judge LLM with simple retry on transient errors.
+
+        On final failure, returns a sentinel JSON object with a NEGATIVE score
+        so `_parse_judgment` can distinguish a genuine 0.0 score from a transport
+        failure and avoid polluting aggregates.
+        """
+        last_err: Optional[Exception] = None
+        for attempt in range(retries + 1):
+            try:
+                resp = self.client.with_options(timeout=45).chat.completions.create(
+                    model=self.model_name,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                )
+                return (resp.choices[0].message.content or "").strip()
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                self.logger.warning(f"Judge LLM call failed (attempt {attempt+1}/{retries+1}): {e}")
+        # All retries failed — return a sentinel that signals "missing", not "zero"
+        self.logger.error(f"Judge LLM call failed after retries: {last_err}")
+        return json.dumps({"score": None, "reasoning": f"Judge LLM error: {last_err}", "_failed": True})
+
+    @staticmethod
+    def _parse_judgment(text: str, score_range=(0.0, 1.0)):
+        """Robust JSON parser — tolerates Markdown code fences and extra prose.
+
+        Returns (score, reasoning). Score is `None` when the call failed at the
+        transport layer (so aggregators can distinguish failure from a real 0).
+        """
+        if not text:
+            return None, "empty response"
+        cleaned = text.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
+        if not cleaned.lstrip().startswith("{"):
+            m = re.search(r"\{[\s\S]*\}", cleaned)
+            if m:
+                cleaned = m.group(0)
+        try:
+            obj = json.loads(cleaned)
+        except json.JSONDecodeError:
+            return None, f"Failed to parse JSON: {text[:200]}"
+        # Distinguish a transport failure from a real score
+        if obj.get("_failed") or obj.get("score") is None:
+            return None, str(obj.get("reasoning", "judge failed"))
+        try:
+            score = float(obj["score"])
+        except (TypeError, ValueError, KeyError):
+            return None, "non-numeric score"
+        lo, hi = score_range
+        score = max(lo, min(hi, score))
+        return score, str(obj.get("reasoning", ""))
+
+    # ---- Trace persistence -------------------------------------------------
+
+    def _save_trace(
+        self,
+        query_id: Optional[str],
+        perspective: str,
+        criterion: str,
+        prompt: str,
+        raw_response: str,
+    ) -> None:
+        try:
+            self._trace_seq += 1
+            qid = query_id or f"adhoc{self._trace_seq:04d}"
+            fname = f"{qid}_{perspective}_{criterion}.json"
+            payload = {
+                "timestamp": datetime.now().isoformat(),
+                "query_id": qid,
+                "perspective": perspective,
+                "criterion": criterion,
+                "model": self.model_name,
+                "prompt": prompt,
+                "raw_response": raw_response,
+            }
+            with open(self.trace_dir / fname, "w") as f:
+                json.dump(payload, f, indent=2)
+        except Exception as e:  # noqa: BLE001
+            self.logger.warning(f"Failed to save judge trace: {e}")

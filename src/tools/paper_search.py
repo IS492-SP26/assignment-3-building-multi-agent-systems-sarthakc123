@@ -11,6 +11,17 @@ from typing import List, Dict, Any, Optional
 import os
 import logging
 import asyncio
+import concurrent.futures
+
+
+def _run_coro_safely(coro):
+    """Run an async coroutine from sync code, even when an event loop is active."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()
 
 
 class PaperSearchTool:
@@ -279,7 +290,7 @@ def paper_search(query: str, max_results: int = 10, year_from: Optional[int] = N
         Formatted string with paper results
     """
     tool = PaperSearchTool(max_results=max_results)
-    results = asyncio.run(tool.search(query, year_from=year_from))
+    results = _run_coro_safely(tool.search(query, year_from=year_from))
     
     if not results:
         return "No academic papers found."

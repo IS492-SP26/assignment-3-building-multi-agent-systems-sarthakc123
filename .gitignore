@@ -212,6 +212,20 @@ logs/
 data/*.json
 data/*.csv
 !data/example_queries.json
-outputs/
+!data/safety_test_queries.json
+
+# Ignore runtime outputs but KEEP the committed sample artifacts
+outputs/*
+!outputs/.gitkeep
+!outputs/sample_session.json
+!outputs/sample_answer.md
+!outputs/sample_judge.json
+!outputs/sample_nli_ablation.json
+!outputs/human_ratings.jsonl
+!outputs/judge_traces/
+outputs/judge_traces/*
+!outputs/judge_traces/.gitkeep
+!outputs/judge_traces/sample_*.json
+
 *.pkl
 *.pickle
